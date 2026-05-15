@@ -1,0 +1,22 @@
+# macOS / editor noise
+.DS_Store
+.ipynb_checkpoints/
+
+# Python cache / build artifacts
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+
+# Local logs
+*.log
+log.txt
+
+# Generated outputs
+output/**/*.fits
+output/**/*.fits.gz
+
+# Optional analysis byproducts
+plots/*.png
+plots/*.pdf
+plots/*.svg

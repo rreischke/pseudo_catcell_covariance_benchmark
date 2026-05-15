@@ -15,7 +15,9 @@ Configuration via environment variables (all optional, sane defaults given):
                        [default: data/cell_chime.npz  relative to this script]
     POSITIONS_PATH   – path to FITS table with source positions
                        [default: data/chimefrbcat2.fits]
-    OUTPUT_PATH      – path to write the output FITS file
+    OUTPUT_PATH      – base path to write the output FITS file; the script
+                       appends a suffix describing the position mode
+                       (catalog, masked_fixed, masked_resampled)
                        [default: output/mock_catalogues.fits]
     NSIDE            – HEALPix NSIDE for synfast  [default: 4096]
     N_REALISATIONS   – number of realisations to generate  [default: 100]
@@ -33,6 +35,21 @@ Configuration via environment variables (all optional, sane defaults given):
                        [default: auto (uses lmax_syn and 3*NSIDE-1)]
     PCL_NBINS        – number of geometric ell bins for the pseudo-C_ell
                        [default: 9]
+    USE_HEALPIX_MAP  – if 'true', build a HEALPix map and interpolate from it
+                       [default: false]
+    POSITION_SOURCE  – 'catalog' or 'mask' position generation
+                       [default: catalog]
+    POSITION_MASK_PATH – path to non-binary probability mask FITS map
+                       [default: output/chime/detection_probability_mask_nside128.fits]
+    POSITION_MASK_MODE – when POSITION_SOURCE='mask':
+                       'fixed' (sample once, reuse all realisations) or
+                       'resample' (new sampled positions per realisation)
+                       [default: fixed]
+    N_SOURCES        – number of positions to sample when POSITION_SOURCE='mask';
+                       if <=0, use the size of POSITIONS_PATH catalogue
+                       [default: 0]
+    WRITE_EVERY      – flush FITS updates to disk every N realisations
+                       [default: 100]
     RESUME           – if 'true', skip already-completed realisations found in
                        an existing output file  [default: true]
 """
@@ -44,6 +61,34 @@ import healpy as hp
 from astropy.table import Table
 from astropy.io import fits
 from scipy.interpolate import InterpolatedUnivariateSpline
+from scipy.special import sph_harm
+from scipy.integrate import simpson
+from scipy.spatial import cKDTree
+
+
+def _with_position_suffix(output_path, position_source, position_mask_mode):
+    """Append a descriptive position-source suffix to the output FITS filename."""
+    if output_path.endswith(".fits.gz"):
+        stem = output_path[:-8]
+        ext = ".fits.gz"
+    else:
+        stem, ext = os.path.splitext(output_path)
+
+    if position_source == "catalog":
+        suffix = "_catalog"
+    elif position_source == "mask":
+        if position_mask_mode == "fixed":
+            suffix = "_masked_fixed"
+        elif position_mask_mode == "resample":
+            suffix = "_masked_resampled"
+        else:
+            suffix = f"_masked_{position_mask_mode}"
+    else:
+        suffix = f"_{position_source}"
+
+    if stem.endswith(suffix):
+        return output_path
+    return f"{stem}{suffix}{ext}"
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -52,9 +97,9 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 
 CL_PATH        = os.getenv("CL_PATH",        os.path.join(_HERE, "data", "cell_chime.npz"))
 POSITIONS_PATH = os.getenv("POSITIONS_PATH", os.path.join(_HERE, "data", "chimefrbcat2.fits"))
-OUTPUT_PATH    = os.getenv("OUTPUT_PATH",    os.path.join(_HERE, "output/chime", "mock_catalogues.fits"))
-NSIDE          = int(os.getenv("NSIDE",           "2048"))
-N_REALISATIONS = int(os.getenv("N_REALISATIONS",  "200"))
+_OUTPUT_PATH_RAW = os.getenv("OUTPUT_PATH",  os.path.join(_HERE, "output/forecast", "mock_catalogues.fits"))
+NSIDE          = int(os.getenv("NSIDE",           "256"))
+N_REALISATIONS = int(os.getenv("N_REALISATIONS",  "10000"))
 NOISE_MEAN     = float(os.getenv("NOISE_MEAN",    "50.0"))
 NOISE_VAR      = float(os.getenv("NOISE_VAR",     "2500.0"))
 SEED_START     = int(os.getenv("SEED_START",      "0"))
@@ -65,6 +110,60 @@ _PCL_LMAX_RAW  = os.getenv("PCL_LMAX", "").strip()
 PCL_LMAX       = int(_PCL_LMAX_RAW) if _PCL_LMAX_RAW else None
 PCL_NBINS      = int(os.getenv("PCL_NBINS",      "12"))
 RESUME         = os.getenv("RESUME", "false").strip().lower() in ("1", "true", "yes")
+USE_HEALPIX_MAP = os.getenv("USE_HEALPIX_MAP", "true").strip().lower() in ("1", "true", "yes")
+WRITE_EVERY    = int(os.getenv("WRITE_EVERY",    "500"))
+POSITION_SOURCE = os.getenv("POSITION_SOURCE", "mask").strip().lower()
+POSITION_MASK_PATH = os.getenv(
+    "POSITION_MASK_PATH",
+    os.path.join(_HERE, "output", "chime", "detection_probability_mask_nside128.fits"),
+)
+POSITION_MASK_MODE = os.getenv("POSITION_MASK_MODE", "fixed").strip().lower()
+N_SOURCES = int(os.getenv("N_SOURCES", "100000"))
+OUTPUT_PATH = _with_position_suffix(_OUTPUT_PATH_RAW, POSITION_SOURCE, POSITION_MASK_MODE)
+
+
+def next_power_of_two(value):
+    """Return the smallest power of two greater than or equal to value."""
+    value = max(1, int(value))
+    return 1 << (value - 1).bit_length()
+
+
+def load_probability_mask(mask_path):
+    """Load and sanitize a non-binary probability mask map."""
+    if not os.path.exists(mask_path):
+        raise FileNotFoundError(f"Mask file not found: {mask_path}")
+
+    mask_map = hp.read_map(mask_path, verbose=False)
+    mask_map = np.asarray(mask_map, dtype=float)
+    if mask_map.ndim > 1:
+        mask_map = mask_map[0]
+
+    mask_map = np.where(np.isfinite(mask_map), mask_map, 0.0)
+    mask_map = np.clip(mask_map, 0.0, None)
+    max_val = np.max(mask_map)
+    if max_val <= 0.0:
+        raise ValueError("Probability mask has no positive entries.")
+    return mask_map / max_val
+
+
+def sample_positions_from_probability_mask(prob_mask, n_samples, rng):
+    """Sample RA/Dec positions from a probability mask."""
+    if n_samples < 1:
+        raise ValueError("n_samples must be >= 1")
+
+    npix = len(prob_mask)
+    pix = np.arange(npix, dtype=np.int64)
+    weights = np.asarray(prob_mask, dtype=float)
+    weight_sum = weights.sum()
+    if weight_sum <= 0.0:
+        raise ValueError("Probability mask sum is not positive.")
+    probs = weights / weight_sum
+
+    chosen_pix = rng.choice(pix, size=int(n_samples), p=probs)
+    theta, phi = hp.pix2ang(hp.npix2nside(npix), chosen_pix)
+    ra = np.degrees(phi)
+    dec = 90.0 - np.degrees(theta)
+    return ra.astype(float), dec.astype(float)
 
 # ---------------------------------------------------------------------------
 # Helper: load source positions from FITS catalogue
@@ -103,9 +202,17 @@ def load_positions(fits_path):
                 seen.add(name)
                 keep.append(i)
         tab = tab[keep]
-
-    ra  = np.asarray(tab[ra_col],  dtype=float)
+    ra = np.asarray(tab[ra_col], dtype=float)
     dec = np.asarray(tab[dec_col], dtype=float)
+
+    # Drop rows with invalid positions before returning coordinates.
+    valid_pos = np.isfinite(ra) & np.isfinite(dec)
+    n_bad = int((~valid_pos).sum())
+    if n_bad > 0:
+        print(f"Removed {n_bad} rows with invalid RA/Dec (NaN or inf) from input catalogue.")
+        ra = ra[valid_pos]
+        dec = dec[valid_pos]
+
     return ra, dec
 
 
@@ -127,14 +234,80 @@ def load_positions_from_output(fits_path):
 
     ra = np.asarray(tab[ra_col], dtype=float)
     dec = np.asarray(tab[dec_col], dtype=float)
+
+    valid_pos = np.isfinite(ra) & np.isfinite(dec)
+    n_bad = int((~valid_pos).sum())
+    if n_bad > 0:
+        print(f"Removed {n_bad} rows with invalid RA/Dec (NaN or inf) from saved output catalogue.")
+        ra = ra[valid_pos]
+        dec = dec[valid_pos]
+
     return ra, dec
+
+
+def compute_mean_interparticle_distance(ra, dec):
+    """Return the mean nearest-neighbor separation on the sphere in radians."""
+    ra = np.asarray(ra, dtype=float)
+    dec = np.asarray(dec, dtype=float)
+
+    valid = np.isfinite(ra) & np.isfinite(dec)
+    ra = ra[valid]
+    dec = dec[valid]
+
+    n_obj = ra.size
+    if n_obj < 2:
+        return np.nan
+
+    ra_rad = np.radians(ra)
+    dec_rad = np.radians(dec)
+    cos_dec = np.cos(dec_rad)
+    xyz = np.column_stack([
+        cos_dec * np.cos(ra_rad),
+        cos_dec * np.sin(ra_rad),
+        np.sin(dec_rad),
+    ])
+
+    tree = cKDTree(xyz)
+    distances, _ = tree.query(xyz, k=2)
+    nearest_chord = np.clip(distances[:, 1], 0.0, 2.0)
+    nearest_angle = 2.0 * np.arcsin(0.5 * nearest_chord)
+    return float(np.mean(nearest_angle))
+
+
+def derive_resolution_from_mean_separation(mean_sep_rad, nside_min=1):
+    """Convert mean separation into a characteristic ell_max and NSIDE.
+
+    Uses the standard rule-of-thumb ell ~ pi / theta and enforces
+    lmax <= 3 * nside - 1 via the smallest power-of-two NSIDE satisfying it.
+    """
+    if not np.isfinite(mean_sep_rad) or mean_sep_rad <= 0.0:
+        raise ValueError("mean_sep_rad must be finite and positive")
+
+    ell_max = max(2, int(np.floor(np.pi / mean_sep_rad)))
+    nside_required = next_power_of_two(int(np.ceil((ell_max + 1) / 1.0)))
+    return ell_max, max(int(nside_min), nside_required)
+
+
+def get_positions_for_realisation(idx, base_ra, base_dec, position_source, position_mask_mode, prob_mask, n_samples):
+    """Return the RA/Dec positions to use for a given realisation index."""
+    if position_source != "mask":
+        return base_ra, base_dec
+
+    if position_mask_mode == "fixed":
+        return base_ra, base_dec
+
+    if position_mask_mode == "resample":
+        rng_pos = np.random.default_rng(SEED_START + 1000000 + int(idx))
+        return sample_positions_from_probability_mask(prob_mask, n_samples=n_samples, rng=rng_pos)
+
+    raise ValueError(f"Unknown POSITION_MASK_MODE: {position_mask_mode}")
 
 
 # ---------------------------------------------------------------------------
 # Helper: build interpolated C_ell array for hp.synfast
 # ---------------------------------------------------------------------------
 
-def build_cl_full(cl_path, nside, lmax_factor):
+def build_cl_full(cl_path, nside, lmax_factor, ell_max_cap=None):
     cl_npz = np.load(cl_path)
     if not {"ell", "cell"}.issubset(cl_npz.files):
         raise ValueError(f"{cl_path} must contain 'ell' and 'cell' arrays")
@@ -157,6 +330,8 @@ def build_cl_full(cl_path, nside, lmax_factor):
     )
 
     lmax_syn = min(int(unique_ell.max()), lmax_factor * nside - 1)
+    if ell_max_cap is not None:
+        lmax_syn = min(lmax_syn, int(ell_max_cap))
     ells_full = np.arange(lmax_syn + 1, dtype=float)
     cl_full = np.zeros(lmax_syn + 1, dtype=float)
 
@@ -167,7 +342,50 @@ def build_cl_full(cl_path, nside, lmax_factor):
         cl_full[1] = 0.0
     cl_full = np.maximum(cl_full, 0.0)
 
-    return cl_full, lmax_syn
+    return cl_full, lmax_syn, cl_spline
+
+
+def evaluate_alm_at_positions(alm, lmax, theta, phi, chunk_size=256):
+    """Evaluate a scalar field from packed alm coefficients at arbitrary positions.
+
+    The field is computed directly from the spherical-harmonic expansion,
+    avoiding an intermediate HEALPix map.
+    """
+    theta = np.asarray(theta, dtype=float)
+    phi = np.asarray(phi, dtype=float)
+
+    if theta.shape != phi.shape:
+        raise ValueError("theta and phi must have the same shape")
+
+    values = np.zeros(theta.size, dtype=np.float64)
+    if theta.size == 0:
+        return values
+
+    for start in range(0, theta.size, int(chunk_size)):
+        stop = min(start + int(chunk_size), theta.size)
+        theta_chunk = theta[start:stop]
+        phi_chunk = phi[start:stop]
+        chunk_values = np.zeros(theta_chunk.size, dtype=np.float64)
+
+        for ell in range(lmax + 1):
+            idx_0 = hp.Alm.getidx(lmax, ell, 0)
+            chunk_values += np.real(alm[idx_0] * sph_harm(0, ell, phi_chunk, theta_chunk))
+
+            for m in range(1, ell + 1):
+                idx = hp.Alm.getidx(lmax, ell, m)
+                y_lm = sph_harm(m, ell, phi_chunk, theta_chunk)
+                chunk_values += 2.0 * np.real(alm[idx] * y_lm)
+
+        values[start:stop] = chunk_values
+
+    return values
+
+
+def evaluate_map_at_positions(map_real, theta, phi):
+    """Evaluate a HEALPix map at arbitrary positions with interpolation."""
+    theta = np.asarray(theta, dtype=float)
+    phi = np.asarray(phi, dtype=float)
+    return hp.get_interp_val(map_real, theta, phi)
 
 
 def _get_pymaster():
@@ -233,8 +451,7 @@ def measure_pseudo_cl(ra, dec, data_columns, lmax_pcl, binner):
         pos_data = np.vstack([ra_wrapped[valid], dec[valid]])
         weights = np.ones(valid.sum(), dtype=float)
         field_values = values[valid][np.newaxis, :]
-
-        field = nmt.NmtFieldCatalog(pos_data, weights, field_values, lmax=lmax_pcl, lonlat=True)
+        field = nmt.NmtFieldCatalog(pos_data, weights, field_values- np.mean(field_values), lmax=lmax_pcl, lonlat=True)
         workspace = nmt.NmtWorkspace.from_fields(field, field, binner)
         coupled = nmt.compute_coupled_cell(field, field)
         pseudo_cls[name] = np.asarray(workspace.decouple_cell(coupled)[0], dtype=float)
@@ -246,30 +463,36 @@ def measure_pseudo_cl(ra, dec, data_columns, lmax_pcl, binner):
 # Helper: generate one catalogue realisation
 # ---------------------------------------------------------------------------
 
-def generate_realisation(cl_full, lmax_syn, ra, dec, noise_mean, noise_var, seed):
+def generate_realisation(cl_full, lmax_syn, nside_sim, ra, dec, noise_mean, noise_var, seed, use_healpix_map=False, theory_var=None):
     """
-    Draw a new synfast map and noise realisation.
+    Draw a new alm realisation, evaluate the field directly at the catalogue
+    positions, and add noise.
 
     Returns a dict with keys: DM, DM_gaussian, DM_lognormal.
     """
     rng = np.random.default_rng(seed)
 
-    # New HEALPix map from the same C_ell
-    alm = hp.synalm(cl_full, lmax=lmax_syn, new=True)
-    # Use rng-derived seed for healpy (which uses the global numpy RNG)
+    # New alm realisation from the same C_ell
     np.random.seed(int(rng.integers(0, 2**31)))
-    map_real = hp.alm2map(alm, nside=NSIDE, lmax=lmax_syn)
+    alm = hp.synalm(cl_full, lmax=lmax_syn, new=True)
 
-    # Evaluate map at catalogue positions
+    # Evaluate the field either directly from alm or via a HEALPix map
     ra_hp  = np.where(ra < 0, ra + 360.0, ra)
     theta  = np.clip(np.radians(90.0 - dec), 1e-6, np.pi - 1e-6)
     phi    = np.radians(ra_hp)
 
     valid  = np.isfinite(theta) & np.isfinite(phi)
     dm     = np.full(len(theta), np.nan)
-    dm[valid] = hp.get_interp_val(map_real, theta[valid], phi[valid])
+    if use_healpix_map:
+        map_real = hp.alm2map(alm, nside=nside_sim, lmax=lmax_syn)
+        dm[valid] = evaluate_map_at_positions(map_real, theta[valid], phi[valid])
+    else:
+        dm[valid] = evaluate_alm_at_positions(alm, lmax_syn, theta[valid], phi[valid])
+    if theory_var is not None:
+        diff_var = theory_var - np.var(dm)
 
     # Additive Gaussian noise
+    dm += rng.normal(loc=0, scale=np.sqrt(diff_var), size=len(dm))
     noise_gauss = rng.normal(loc=noise_mean, scale=np.sqrt(noise_var), size=len(dm))
 
     # Additive log-normal noise (matched mean/variance)
@@ -313,7 +536,19 @@ def _completed_realisations(fits_path):
     return real_done, pcl_done
 
 
-def _init_fits(fits_path, ra, dec, cl_full, pcl_edges=None):
+def _init_fits(
+    fits_path,
+    ra,
+    dec,
+    cl_full,
+    nside_sim,
+    mean_sep_rad,
+    ell_max_catalog,
+    pcl_edges=None,
+    position_source="catalog",
+    position_mask_mode="fixed",
+    position_mask_path="",
+):
     """Create a new FITS file with a primary HDU, CATALOG, and CELL extensions."""
     os.makedirs(os.path.dirname(os.path.abspath(fits_path)), exist_ok=True)
 
@@ -325,24 +560,33 @@ def _init_fits(fits_path, ra, dec, cl_full, pcl_edges=None):
     cat_tab["Dec"].unit = "deg"
     cat_hdu = fits.BinTableHDU(cat_tab, name="CATALOG")
     cat_hdu.header["N_SRC"]    = len(ra)
-    cat_hdu.header["NSIDE"]    = NSIDE
+    cat_hdu.header["NSIDE"]    = nside_sim
+    cat_hdu.header["MEANSEPR"] = float(mean_sep_rad)
+    cat_hdu.header["ELLCATA"]  = int(ell_max_catalog)
 
     # Interpolated C_ell
     cl_tab = Table()
     cl_tab["ell"]  = np.arange(len(cl_full), dtype=np.int32)
     cl_tab["cell"] = np.asarray(cl_full, dtype=np.float64)
     cl_hdu = fits.BinTableHDU(cl_tab, name="CELL")
-    cl_hdu.header["NSIDE"]   = NSIDE
+    cl_hdu.header["NSIDE"]   = nside_sim
     cl_hdu.header["LMAX"]    = len(cl_full) - 1
+    cl_hdu.header["ELLCATA"] = int(ell_max_catalog)
 
     primary = fits.PrimaryHDU()
     primary.header["NREAL"]    = 0
-    primary.header["NSIDE"]    = NSIDE
+    primary.header["NSIDE"]    = nside_sim
     primary.header["NOMEAN"]   = NOISE_MEAN
     primary.header["NOVAR"]    = NOISE_VAR
     primary.header["SEEDBASE"] = SEED_START
     primary.header["MEASPCL"]  = int(MEASURE_PCL)
     primary.header["NPCL"]     = 0
+    primary.header["MEANSEPR"] = float(mean_sep_rad)
+    primary.header["ELLCATA"]  = int(ell_max_catalog)
+    primary.header["POSSRC"]   = str(position_source)[:16]
+    primary.header["POSMODE"]  = str(position_mask_mode)[:16]
+    if position_mask_path:
+        primary.header["POSPATH"] = str(position_mask_path)[:68]
     if pcl_edges is not None:
         primary.header["PCLLMIN"] = int(pcl_edges[0])
         primary.header["PCLNBIN"] = len(pcl_edges) - 1
@@ -352,8 +596,8 @@ def _init_fits(fits_path, ra, dec, cl_full, pcl_edges=None):
     hdul.writeto(fits_path, overwrite=True)
 
 
-def _append_realisation(fits_path, idx, data):
-    """Append one realisation as a new BinTable extension and update NREAL."""
+def _append_realisation(hdul, idx, data):
+    """Append one realisation to an open FITS file and update NREAL."""
     real_tab = Table()
     real_tab["DM"]          = np.asarray(data["DM"],          dtype=np.float64)
     real_tab["DM_gaussian"] = np.asarray(data["DM_gaussian"], dtype=np.float64)
@@ -365,15 +609,12 @@ def _append_realisation(fits_path, idx, data):
     real_hdu.header["SEED"] = SEED_START + idx
     real_hdu.header["IDX"]  = idx
 
-    with fits.open(fits_path, mode="append") as hdul:
-        hdul.append(real_hdu)
-        # Update NREAL in primary header
-        hdul[0].header["NREAL"] = hdul[0].header.get("NREAL", 0) + 1
-        hdul.flush()
+    hdul.append(real_hdu)
+    hdul[0].header["NREAL"] = hdul[0].header.get("NREAL", 0) + 1
 
 
-def _append_pseudo_cl(fits_path, idx, leff, pseudo_cls, pcl_edges, lmax_pcl):
-    """Append the binned pseudo-C_ell measurement for one realisation."""
+def _append_pseudo_cl(hdul, idx, leff, pseudo_cls, pcl_edges, lmax_pcl):
+    """Append the binned pseudo-C_ell measurement to an open FITS file."""
     pcl_tab = Table()
     pcl_tab["ell_eff"] = np.asarray(leff, dtype=np.float64)
     pcl_tab["pcl_dm"] = np.asarray(pseudo_cls["DM"], dtype=np.float64)
@@ -390,10 +631,8 @@ def _append_pseudo_cl(fits_path, idx, leff, pseudo_cls, pcl_edges, lmax_pcl):
     pcl_hdu.header["LMAX"] = int(lmax_pcl)
     pcl_hdu.header["NBIN"] = len(leff)
 
-    with fits.open(fits_path, mode="append") as hdul:
-        hdul.append(pcl_hdu)
-        hdul[0].header["NPCL"] = hdul[0].header.get("NPCL", 0) + 1
-        hdul.flush()
+    hdul.append(pcl_hdu)
+    hdul[0].header["NPCL"] = hdul[0].header.get("NPCL", 0) + 1
 
 
 def _load_realisation(fits_path, idx):
@@ -431,10 +670,67 @@ def main():
         print(f"  PCL_LMAX:       {PCL_LMAX if PCL_LMAX is not None else 'auto'}")
         print(f"  PCL_NBINS:      {PCL_NBINS}")
     print(f"  RESUME:         {RESUME}")
+    print(f"  USE_HEALPIX_MAP: {USE_HEALPIX_MAP}")
+    print(f"  WRITE_EVERY:    {WRITE_EVERY}")
+    print(f"  POSITION_SOURCE: {POSITION_SOURCE}")
+    if POSITION_SOURCE == "mask":
+        print(f"  POSITION_MASK_PATH: {POSITION_MASK_PATH}")
+        print(f"  POSITION_MASK_MODE: {POSITION_MASK_MODE}")
+        print(f"  N_SOURCES: {N_SOURCES if N_SOURCES > 0 else 'auto(from catalog)'}")
 
-    # Build C_ell
+    # Load positions
+    print("Loading source positions...")
+    if POSITION_SOURCE not in {"catalog", "mask"}:
+        raise ValueError("POSITION_SOURCE must be either 'catalog' or 'mask'")
+    if POSITION_MASK_MODE not in {"fixed", "resample"}:
+        raise ValueError("POSITION_MASK_MODE must be either 'fixed' or 'resample'")
+
+    prob_mask = None
+    if POSITION_SOURCE == "catalog":
+        if os.path.exists(OUTPUT_PATH) and RESUME:
+            ra, dec = load_positions_from_output(OUTPUT_PATH)
+            print(f"  {len(ra)} sources loaded from existing output catalogue")
+        else:
+            ra, dec = load_positions(POSITIONS_PATH)
+            print(f"  {len(ra)} sources loaded from input catalogue")
+    else:
+        prob_mask = load_probability_mask(POSITION_MASK_PATH)
+        if N_SOURCES > 0:
+            n_sources = int(N_SOURCES)
+        else:
+            # Use input catalogue size as default target number of sampled sources.
+            ra_ref, dec_ref = load_positions(POSITIONS_PATH)
+            n_sources = len(ra_ref)
+        if n_sources < 1:
+            raise ValueError("Number of mask-sampled sources must be >= 1")
+
+        if os.path.exists(OUTPUT_PATH) and RESUME and POSITION_MASK_MODE == "fixed":
+            ra, dec = load_positions_from_output(OUTPUT_PATH)
+            print(f"  {len(ra)} fixed mask-sampled sources loaded from existing output catalogue")
+        else:
+            rng_initial = np.random.default_rng(SEED_START + 999999)
+            ra, dec = sample_positions_from_probability_mask(prob_mask, n_sources, rng_initial)
+            print(f"  {len(ra)} sources sampled from probability mask")
+
+    mean_sep_rad = compute_mean_interparticle_distance(ra, dec)
+    if np.isfinite(mean_sep_rad):
+        mean_sep_deg = np.degrees(mean_sep_rad)
+        print(f"  mean inter-particle separation = {mean_sep_deg:.6f} deg")
+        print(f"                                 = {mean_sep_deg * 60.0:.3f} arcmin")
+    else:
+        print("  mean inter-particle separation = undefined (need at least 2 valid positions)")
+
+    ell_max_catalog, nside_sim = derive_resolution_from_mean_separation(mean_sep_rad, nside_min=NSIDE)
+    print(f"  derived catalog ell_max       = {ell_max_catalog}")
+    print(f"  simulation NSIDE in use       = {nside_sim}")
+
+    # Build C_ell using the catalog-derived angular resolution.
     print("\nBuilding interpolated C_ell...")
-    cl_full, lmax_syn = build_cl_full(CL_PATH, NSIDE, LMAX_FACTOR)
+    cl_full, lmax_syn, cl_spline = build_cl_full(CL_PATH, nside_sim, LMAX_FACTOR, ell_max_cap=ell_max_catalog)
+    ell_int = np.geomspace(2, int(1e5), num=1000)
+    cl_int = np.exp(cl_spline(np.log(ell_int)))
+    theory_var = simpson(cl_int * ell_int / (2 * np.pi), x=ell_int)
+
     print(f"  lmax_syn = {lmax_syn}, cl_full shape = {cl_full.shape}")
 
     pcl_binner = None
@@ -443,19 +739,11 @@ def main():
     if MEASURE_PCL:
         print("Building pseudo-C_ell binning...")
         pcl_binner, pcl_leff, pcl_edges = build_pcl_binner(
-            NSIDE, lmax_syn, PCL_LMIN, PCL_NBINS, lmax_user=PCL_LMAX
+            nside_sim, lmax_syn, PCL_LMIN, PCL_NBINS, lmax_user=PCL_LMAX
         )
         print(f"  pseudo-C_ell bandpowers = {len(pcl_leff)}")
 
-    # Load positions
-    print("Loading source positions...")
-    if os.path.exists(OUTPUT_PATH) and RESUME:
-        ra, dec = load_positions_from_output(OUTPUT_PATH)
-        print(f"  {len(ra)} sources loaded from existing output catalogue")
-    else:
-        ra, dec = load_positions(POSITIONS_PATH)
-        print(f"  {len(ra)} sources loaded from input catalogue")
-
+    
     # Determine which realisations still need to be done
     real_done, pcl_done = _completed_realisations(OUTPUT_PATH) if RESUME else (set(), set())
     todo_real = [i for i in range(N_REALISATIONS) if i not in real_done]
@@ -468,28 +756,79 @@ def main():
     # Initialise FITS file if it does not exist yet (or if not resuming)
     if not os.path.exists(OUTPUT_PATH) or not RESUME:
         print(f"Initialising output FITS: {OUTPUT_PATH}")
-        _init_fits(OUTPUT_PATH, ra, dec, cl_full, pcl_edges=pcl_edges)
+        _init_fits(
+            OUTPUT_PATH,
+            ra,
+            dec,
+            cl_full,
+            nside_sim,
+            mean_sep_rad,
+            ell_max_catalog,
+            pcl_edges=pcl_edges,
+            position_source=POSITION_SOURCE,
+            position_mask_mode=POSITION_MASK_MODE,
+            position_mask_path=POSITION_MASK_PATH if POSITION_SOURCE == "mask" else "",
+        )
 
     if todo_pcl:
         print(f"\nBackfilling pseudo-C_ell for {len(todo_pcl)} completed realisation(s)...")
-        for count, idx in enumerate(todo_pcl):
-            data = _load_realisation(OUTPUT_PATH, idx)
-            pseudo_cls = measure_pseudo_cl(ra, dec, data, lmax_syn, pcl_binner)
-            _append_pseudo_cl(OUTPUT_PATH, idx, pcl_leff, pseudo_cls, pcl_edges, lmax_syn)
-            print(f"  [{count+1}/{len(todo_pcl)}] pseudo-C_ell {idx:5d} done", flush=True)
+        with fits.open(OUTPUT_PATH, mode="append") as hdul:
+            for count, idx in enumerate(todo_pcl):
+                data = _load_realisation(OUTPUT_PATH, idx)
+                ra_i, dec_i = get_positions_for_realisation(
+                    idx,
+                    ra,
+                    dec,
+                    POSITION_SOURCE,
+                    POSITION_MASK_MODE,
+                    prob_mask,
+                    len(ra),
+                )
+                pseudo_cls = measure_pseudo_cl(ra_i, dec_i, data, lmax_syn, pcl_binner)
+                _append_pseudo_cl(hdul, idx, pcl_leff, pseudo_cls, pcl_edges, lmax_syn)
+                should_flush = ((count + 1) % WRITE_EVERY == 0) or (count + 1 == len(todo_pcl))
+                if should_flush:
+                    hdul.flush()
+                print(f"  [{count+1}/{len(todo_pcl)}] pseudo-C_ell {idx:5d} done", flush=True)
 
     print(f"\nGenerating {len(todo_real)} realisation(s) "
           f"({len(real_done)} already done, {N_REALISATIONS} total)...")
 
-    for count, idx in enumerate(todo_real):
-        seed = SEED_START + idx
-        data = generate_realisation(cl_full, lmax_syn, ra, dec, NOISE_MEAN, NOISE_VAR, seed)
-        _append_realisation(OUTPUT_PATH, idx, data)
-        if MEASURE_PCL:
-            pseudo_cls = measure_pseudo_cl(ra, dec, data, lmax_syn, pcl_binner)
-            _append_pseudo_cl(OUTPUT_PATH, idx, pcl_leff, pseudo_cls, pcl_edges, lmax_syn)
-        print(f"  [{count+1}/{len(todo_real)}] realisation {idx:5d} done  "
-              f"(DM mean = {np.nanmean(data['DM']):.4e})", flush=True)
+    with fits.open(OUTPUT_PATH, mode="append") as hdul:
+        for count, idx in enumerate(todo_real):
+            seed = SEED_START + idx
+            ra_i, dec_i = get_positions_for_realisation(
+                idx,
+                ra,
+                dec,
+                POSITION_SOURCE,
+                POSITION_MASK_MODE,
+                prob_mask,
+                len(ra),
+            )
+            data = generate_realisation(
+                cl_full,
+                lmax_syn,
+                nside_sim,
+                ra_i,
+                dec_i,
+                NOISE_MEAN,
+                NOISE_VAR,
+                seed,
+                use_healpix_map=USE_HEALPIX_MAP,
+                theory_var=theory_var,
+            )
+            _append_realisation(hdul, idx, data)
+            if MEASURE_PCL:
+                pseudo_cls = measure_pseudo_cl(ra_i, dec_i, data, lmax_syn, pcl_binner)
+                _append_pseudo_cl(hdul, idx, pcl_leff, pseudo_cls, pcl_edges, lmax_syn)
+
+            should_flush = ((count + 1) % WRITE_EVERY == 0) or (count + 1 == len(todo_real))
+            if should_flush:
+                hdul.flush()
+
+            print(f"  [{count+1}/{len(todo_real)}] realisation {idx:5d} done  "
+                  f"(DM mean = {np.nanmean(data['DM']):.4e})", flush=True)
 
     print(f"\nFinished. Output written to: {OUTPUT_PATH}")
 
