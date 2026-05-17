@@ -118,7 +118,7 @@ POSITION_MASK_PATH = os.getenv(
     os.path.join(_HERE, "output", "chime", "detection_probability_mask_nside128.fits"),
 )
 POSITION_MASK_MODE = os.getenv("POSITION_MASK_MODE", "fixed").strip().lower()
-N_SOURCES = int(os.getenv("N_SOURCES", "100000"))
+N_SOURCES = int(os.getenv("N_SOURCES", "50000"))
 OUTPUT_PATH = _with_position_suffix(_OUTPUT_PATH_RAW, POSITION_SOURCE, POSITION_MASK_MODE)
 
 
