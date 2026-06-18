@@ -11,46 +11,46 @@ If enabled, each realisation also gets a PCL_NNNNN extension with a binned
 pseudo-C_ell measurement derived from the sampled catalogue values.
 
 Configuration via environment variables (all optional, sane defaults given):
-    CL_PATH          – path to the .npz file with 'ell' and 'cell' keys
+    CL_PATH          - path to the .npz file with 'ell' and 'cell' keys
                        [default: data/cell_chime.npz  relative to this script]
-    POSITIONS_PATH   – path to FITS table with source positions
-                       [default: data/chimefrbcat2.fits]
-    OUTPUT_PATH      – base path to write the output FITS file; the script
+    POSITIONS_PATH   - path to text file with source positions (RA, Dec)
+                       [default: data/chimefrbcat2_radec.txt]
+    OUTPUT_PATH      - base path to write the output FITS file; the script
                        appends a suffix describing the position mode
                        (catalog, masked_fixed, masked_resampled)
                        [default: output/mock_catalogues.fits]
-    NSIDE            – HEALPix NSIDE for synfast  [default: 4096]
-    N_REALISATIONS   – number of realisations to generate  [default: 100]
-    NOISE_MEAN       – mean of additive noise  [default: 50.0]
-    NOISE_VAR        – variance (sigma^2) of additive noise  [default: 2500.0]
-    SEED_START       – base random seed; realisation i uses SEED_START + i
+    NSIDE            - HEALPix NSIDE for synfast  [default: 4096]
+    N_REALISATIONS   - number of realisations to generate  [default: 100]
+    NOISE_MEAN       - mean of additive noise  [default: 50.0]
+    NOISE_VAR        - variance (sigma^2) of additive noise  [default: 2500.0]
+    SEED_START       - base random seed; realisation i uses SEED_START + i
                        [default: 0]
-    LMAX_FACTOR      – lmax = min(max_input_ell, LMAX_FACTOR * NSIDE - 1)
+    LMAX_FACTOR      - lmax = min(max_input_ell, LMAX_FACTOR * NSIDE - 1)
                        [default: 3]
-    MEASURE_PCL      – if 'true', measure a pseudo-C_ell with NaMaster
+    MEASURE_PCL      - if 'true', measure a pseudo-C_ell with NaMaster
                        [default: true]
-    PCL_LMIN         – minimum multipole used for pseudo-C_ell binning
+    PCL_LMIN         - minimum multipole used for pseudo-C_ell binning
                        [default: 40]
-    PCL_LMAX         – maximum multipole used for pseudo-C_ell binning
+    PCL_LMAX         - maximum multipole used for pseudo-C_ell binning
                        [default: auto (uses lmax_syn and 3*NSIDE-1)]
-    PCL_NBINS        – number of geometric ell bins for the pseudo-C_ell
+    PCL_NBINS        - number of geometric ell bins for the pseudo-C_ell
                        [default: 9]
-    USE_HEALPIX_MAP  – if 'true', build a HEALPix map and interpolate from it
+    USE_HEALPIX_MAP  - if 'true', build a HEALPix map and interpolate from it
                        [default: false]
-    POSITION_SOURCE  – 'catalog' or 'mask' position generation
+    POSITION_SOURCE  - 'catalog' or 'mask' position generation
                        [default: catalog]
-    POSITION_MASK_PATH – path to non-binary probability mask FITS map
+    POSITION_MASK_PATH - path to non-binary probability mask FITS map
                        [default: output/chime/detection_probability_mask_nside128.fits]
-    POSITION_MASK_MODE – when POSITION_SOURCE='mask':
+    POSITION_MASK_MODE - when POSITION_SOURCE='mask':
                        'fixed' (sample once, reuse all realisations) or
                        'resample' (new sampled positions per realisation)
                        [default: fixed]
-    N_SOURCES        – number of positions to sample when POSITION_SOURCE='mask';
+    N_SOURCES        - number of positions to sample when POSITION_SOURCE='mask';
                        if <=0, use the size of POSITIONS_PATH catalogue
                        [default: 0]
-    WRITE_EVERY      – flush FITS updates to disk every N realisations
+    WRITE_EVERY      - flush FITS updates to disk every N realisations
                        [default: 100]
-    RESUME           – if 'true', skip already-completed realisations found in
+    RESUME           - if 'true', skip already-completed realisations found in
                        an existing output file  [default: true]
 """
 
@@ -96,7 +96,7 @@ def _with_position_suffix(output_path, position_source, position_mask_mode):
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
 CL_PATH        = os.getenv("CL_PATH",        os.path.join(_HERE, "data", "cell_chime.npz"))
-POSITIONS_PATH = os.getenv("POSITIONS_PATH", os.path.join(_HERE, "data", "chimefrbcat2.fits"))
+POSITIONS_PATH = os.getenv("POSITIONS_PATH", os.path.join(_HERE, "data", "chimefrbcat2_radec.txt"))
 _OUTPUT_PATH_RAW = os.getenv("OUTPUT_PATH",  os.path.join(_HERE, "output/forecast", "mock_catalogues.fits"))
 NSIDE          = int(os.getenv("NSIDE",           "256"))
 N_REALISATIONS = int(os.getenv("N_REALISATIONS",  "10000"))
@@ -427,6 +427,11 @@ def build_pcl_binner(nside, lmax_pcl, lmin, nbins, lmax_user=None):
     if len(edges) < 2:
         raise ValueError("Pseudo-C_ell binning collapsed to fewer than one bandpower.")
 
+    if POSITION_SOURCE == "mask":
+        np.save("./output/forecast/pcl_edges_chime_5000.npy", edges)
+    else:
+        np.save("./output/chime/pcl_edges_chime.npy", edges)
+
     binner = nmt.NmtBin.from_edges(edges[:-1], edges[1:])
     leff = np.asarray(binner.get_effective_ells(), dtype=float)
     return binner, leff, edges
@@ -691,7 +696,7 @@ def main():
             ra, dec = load_positions_from_output(OUTPUT_PATH)
             print(f"  {len(ra)} sources loaded from existing output catalogue")
         else:
-            ra, dec = load_positions(POSITIONS_PATH)
+            ra, dec = np.loadtxt(POSITIONS_PATH, usecols=(0, 1), unpack=True)
             print(f"  {len(ra)} sources loaded from input catalogue")
     else:
         prob_mask = load_probability_mask(POSITION_MASK_PATH)
@@ -699,7 +704,7 @@ def main():
             n_sources = int(N_SOURCES)
         else:
             # Use input catalogue size as default target number of sampled sources.
-            ra_ref, dec_ref = load_positions(POSITIONS_PATH)
+            ra_ref, dec_ref = np.loadtxt(POSITIONS_PATH, usecols=(0, 1), unpack=True)
             n_sources = len(ra_ref)
         if n_sources < 1:
             raise ValueError("Number of mask-sampled sources must be >= 1")
