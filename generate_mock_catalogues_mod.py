@@ -2,7 +2,7 @@
 
 Configuration via environment variables (all optional, sane defaults given):
     CL_PATH          - path to the .npz file with 'ell' and 'cell' keys
-                       [default: data/cell_chime.npz  relative to this script]
+                       [default: data/cell_chime_multipoles.npz  relative to this script]
     POSITIONS_PATH   - path to text file with source positions (RA, Dec)
                        [default: data/chimefrbcat2_radec.txt]
     OUTPUT_PATH      - base path to write the output NPZ file; the script
@@ -23,10 +23,8 @@ Configuration via environment variables (all optional, sane defaults given):
                        [default: 2]
     PCL_LMAX         - maximum multipole used for pseudo-C_ell binning
                        [default: auto (uses lmax_syn and 3*NSIDE-1)]
-    PCL_NBINS        - number of ell bins for the pseudo-C_ell
+    PCL_NBINS        - number of geometric ell bins for the pseudo-C_ell
                        [default: 12]
-    PCL_BINNING      - binning scheme: 'log' (geometric) or 'linear'
-                       [default: log]
     PCL_COUPLED      - if 'true', store the coupled (per-multipole) pseudo-C_ell
                        instead of the decoupled bandpower estimates
                        [default: false]
@@ -47,12 +45,19 @@ Configuration via environment variables (all optional, sane defaults given):
                        an existing output file  [default: false]
 """
 
+# CHANGELOG:
+# * Take CHIME C_ells from per-ell file
+# * Don't interpolate theory C_ells
+# * Sample random source uniformly across the sky
+# * Do not subtract mean from field values.
+# * Load CHIME positions from original file, and ignore POSITION_PATH
+#   (This is the change that fixes the bug)
+
 import os
 import numpy as np
 import healpy as hp
 from scipy.interpolate import InterpolatedUnivariateSpline
 import pymaster as nmt
-from scipy.integrate import simpson
 
 
 def _with_position_suffix(output_path, position_source, position_mask_mode):
@@ -77,9 +82,9 @@ def _with_position_suffix(output_path, position_source, position_mask_mode):
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
-CL_PATH        = os.getenv("CL_PATH",        os.path.join(_HERE, "data", "cell_chime.npz"))
+CL_PATH        = os.getenv("CL_PATH",        os.path.join(_HERE, "data", "cell_chime_multipoles.npz"))
 POSITIONS_PATH = os.getenv("POSITIONS_PATH", os.path.join(_HERE, "data", "chimefrbcat2_radec.txt"))
-_OUTPUT_PATH_RAW = os.getenv("OUTPUT_PATH",  os.path.join(_HERE, "output", "mock.npz"))
+_OUTPUT_PATH_RAW = os.getenv("OUTPUT_PATH",  os.path.join(_HERE, "output", "mock_mod.npz"))
 NSIDE          = int(os.getenv("NSIDE",           "256"))
 N_REALISATIONS = int(os.getenv("N_REALISATIONS",  "10000"))
 NOISE_MEAN     = float(os.getenv("NOISE_MEAN",    "50.0"))
@@ -91,7 +96,6 @@ PCL_LMIN       = int(os.getenv("PCL_LMIN",       "2"))
 _PCL_LMAX_RAW  = os.getenv("PCL_LMAX", "").strip()
 PCL_LMAX       = int(_PCL_LMAX_RAW) if _PCL_LMAX_RAW else None
 PCL_NBINS      = int(os.getenv("PCL_NBINS",      "12"))
-PCL_BINNING    = os.getenv("PCL_BINNING", "log").strip().lower()   # 'log' or 'linear'
 PCL_COUPLED    = os.getenv("PCL_COUPLED", "false").strip().lower() in ("1", "true", "yes")
 RESUME         = os.getenv("RESUME", "false").strip().lower() in ("1", "true", "yes")
 WRITE_EVERY    = int(os.getenv("WRITE_EVERY",    "500"))
@@ -123,284 +127,56 @@ def load_probability_mask(mask_path):
     return mask_map / max_val
 
 
-def sample_positions_from_probability_mask(prob_mask, n_samples, rng, pixel_nside=None):
-    """Sample RA/Dec positions from a probability mask, guaranteed unique.
-
-    The mask is reprojected to pixel_nside (or kept at its native resolution if
-    pixel_nside is None) and n_samples pixel centres are drawn without
-    replacement, so no duplicate coordinates are possible after snapping.
+def get_catalog(npoints, m, seed, verbose=False):
     """
+    Generates point catalog given a modulating mask m.
+
+    Parameters:
+        npoints: upper limit to number of points generated
+        m: spin-0 map. modulation mask
+        seed: random seed
+    Returns:
+        pos: Catalog positions
+    """
+#    np.random.seed(seed)
+    m = m / np.amax(m)  # new: normalize to [0,1]
+    npix = len(m)
+    npoints_get = int(npoints/np.mean(m))
+    if npoints_get > 1e7 and verbose:
+        print(f"WARNING: Npoints = {npoints_get}. "
+              "Consider decreasing nhope or steepening power spectrum slope.")
+    phi = 2*np.pi*np.random.rand(npoints_get)
+    th = np.arccos(-1+2*np.random.rand(npoints_get))
+    ipix = hp.ang2pix(hp.npix2nside(npix), th, phi)
+    mv = m[ipix]
+    u = np.random.rand(npoints_get)
+    keep = u <= mv
+    th = th[keep]
+    phi = phi[keep]
+    return np.array([th, phi], dtype=np.float64)
+
+
+def sample_positions_from_probability_mask(prob_mask, n_samples, seed):
+    """Sample RA/Dec positions from a probability mask."""
     if n_samples < 1:
         raise ValueError("n_samples must be >= 1")
 
-    nside_mask = hp.npix2nside(len(prob_mask))
-    if pixel_nside is None:
-        pixel_nside = nside_mask
+    theta, phi = get_catalog(n_samples, prob_mask, seed)
+    ra = np.deg2rad(phi)
+    dec = 90. - np.rad2deg(theta)
+    return ra.astype(float), dec.astype(float)
 
-    if pixel_nside != nside_mask:
-        fine_mask = hp.ud_grade(prob_mask, pixel_nside)
-        fine_mask = np.clip(fine_mask, 0.0, None)
-    else:
-        fine_mask = np.asarray(prob_mask, dtype=float)
+    npix = len(prob_mask)
+    probs = np.asarray(prob_mask, dtype=float)
+    probs = probs / probs.sum()
 
-    npix = len(fine_mask)
-    if n_samples > npix:
-        raise ValueError(
-            f"n_samples={n_samples} exceeds available pixels={npix} at nside={pixel_nside}"
-        )
-
-    probs = fine_mask / fine_mask.sum()
-    chosen_pix = rng.choice(npix, size=n_samples, p=probs, replace=False)
-    theta, phi = hp.pix2ang(pixel_nside, chosen_pix)
+    # TODO: Here, we may instead distribute sources continuously across RA/DEC
+    # and up/downsample them according to the mask
+    chosen_pix = rng.choice(npix, size=int(n_samples), p=probs)
+    theta, phi = hp.pix2ang(hp.npix2nside(npix), chosen_pix)
     ra = np.degrees(phi)
     dec = 90.0 - np.degrees(theta)
     return ra.astype(float), dec.astype(float)
-
-
-'''def load_positions_from_output(npz_path):
-    """Return (ra, dec) arrays in degrees from a saved output NPZ file."""
-    data = np.load(npz_path, allow_pickle=False)
-    if "ra" not in data or "dec" not in data:
-        raise ValueError(
-            f"Existing output file {npz_path} is missing 'ra' or 'dec' arrays. "
-            f"Available keys: {list(data.keys())}"
-        )
-    ra  = np.asarray(data["ra"],  dtype=float)
-    dec = np.asarray(data["dec"], dtype=float)
-
-    valid_pos = np.isfinite(ra) & np.isfinite(dec)
-    n_bad = int((~valid_pos).sum())
-    if n_bad > 0:
-        print(f"Removed {n_bad} rows with invalid RA/Dec (NaN or inf) from saved output.")
-        ra  = ra[valid_pos]
-        dec = dec[valid_pos]
-
-    return ra, dec
-'''
-
-def snap_positions_to_healpix(ra, dec, nside):
-    """Snap (ra, dec) to the nearest HEALPix pixel centre at the given NSIDE.
-
-    Ensures that evaluate_alm_at_positions and NmtFieldCatalog's internal
-    pixelisation both operate at exactly the same sky coordinates.
-    """
-    ra_hp = np.where(ra < 0.0, ra + 360.0, ra)
-    theta = np.radians(90.0 - dec)
-    phi   = np.radians(ra_hp)
-    pix   = hp.ang2pix(nside, theta, phi)
-    theta_c, phi_c = hp.pix2ang(nside, pix)
-    return np.degrees(phi_c), 90.0 - np.degrees(theta_c)
-
-
-def get_positions_for_realisation(idx, base_ra, base_dec, prob_mask, n_samples, nside_cat=None):
-    """Return the RA/Dec positions to use for a given realisation index."""
-    if POSITION_SOURCE != "mask" or POSITION_MASK_MODE == "fixed":
-        return base_ra, base_dec
-
-    rng_pos = np.random.default_rng(SEED_START + 1000000 + int(idx))
-    return sample_positions_from_probability_mask(
-        prob_mask, n_samples=n_samples, rng=rng_pos, pixel_nside=nside_cat
-    )
-
-
-def build_cl_full(cl_path, nside, lmax_factor, ell_max_cap=None):
-    cl_npz = np.load(cl_path)
-    if not {"ell", "cell"}.issubset(cl_npz.files):
-        raise ValueError(f"{cl_path} must contain 'ell' and 'cell' arrays")
-
-    ell   = np.asarray(cl_npz["ell"],  dtype=int)
-    cl_in = np.asarray(cl_npz["cell"], dtype=float)
-    lmax_syn = min(int(ell.max()), lmax_factor * nside - 1)
-    field_variance = simpson(cl_in*ell, ell)/(2*np.pi)
-    if ell_max_cap is not None:
-        lmax_syn = min(lmax_syn, int(ell_max_cap))
-
-    # Build a proper ℓ-indexed array cl_full[ℓ] = C_ℓ starting from ℓ=0.
-    # Input 'ell' may not start at 0; missing entries default to 0.
-    cl_full = np.zeros(lmax_syn + 1, dtype=float)
-    in_range = (ell >= 0) & (ell <= lmax_syn)
-    cl_full[ell[in_range]] = np.maximum(cl_in[in_range], 0.0)
-    return cl_full, lmax_syn, field_variance
-    '''cl_npz = np.load(cl_path)
-    if not {"ell", "cell"}.issubset(cl_npz.files):
-        raise ValueError(f"{cl_path} must contain 'ell' and 'cell' arrays")
-
-    ell   = np.asarray(cl_npz["ell"],  dtype=int)
-    cl_in = np.asarray(cl_npz["cell"], dtype=float)
-    print(ell.shape, cl_in.shape)
-
-    valid = np.isfinite(ell) & np.isfinite(cl_in) & (ell >= 2) & (cl_in > 0)
-    ell, cl_in = ell[valid], cl_in[valid]
-
-    sort_idx = np.argsort(ell)
-    unique_ell, unique_idx = np.unique(ell[sort_idx], return_index=True)
-    unique_cl = cl_in[sort_idx][unique_idx]
-
-    if len(unique_ell) < 4:
-        raise ValueError("Need at least 4 unique C_ell points for a cubic spline.")
-
-    cl_spline = InterpolatedUnivariateSpline(
-        np.log(unique_ell.astype(float)), np.log(unique_cl), k=3
-    )
-
-    lmax_syn = min(int(unique_ell.max()), lmax_factor * nside - 1)
-    if ell_max_cap is not None:
-        lmax_syn = min(lmax_syn, int(ell_max_cap))
-    ells_full = np.arange(lmax_syn + 1, dtype=float)
-    cl_full = np.zeros(lmax_syn + 1, dtype=float)
-
-    mask_eval = (ells_full >= max(2, unique_ell.min())) & (ells_full <= unique_ell.max())
-    cl_full[mask_eval] = np.exp(cl_spline(np.log(ells_full[mask_eval])))
-    cl_full[0] = 0.0
-    if lmax_syn >= 1:
-        cl_full[1] = 0.0
-    cl_full = np.maximum(cl_full, 0.0)
-
-    return cl_full, lmax_syn'''
-
-
-def evaluate_alm_at_positions(alm, lmax, theta, phi, epsilon=1e-7):
-    """Evaluate a scalar field from packed alm coefficients at arbitrary positions.
-
-    Uses ducc0.sht.synthesis_general for fast NUFFT-style evaluation
-    (healpy-packed alm, colatitude theta, longitude phi in radians).
-    """
-    import ducc0
-    theta = np.asarray(theta, dtype=float)
-    phi = np.asarray(phi, dtype=float)
-
-    if theta.shape != phi.shape:
-        raise ValueError("theta and phi must have the same shape")
-
-    if theta.size == 0:
-        return np.zeros(0, dtype=np.float64)
-
-    loc = np.stack([theta.ravel(), phi.ravel()], axis=1)
-    result = ducc0.sht.synthesis_general(
-        alm=np.asarray(alm, dtype=np.complex128)[np.newaxis],
-        spin=0, lmax=lmax, loc=loc, epsilon=epsilon,
-    )
-    return result[0].real.reshape(theta.shape)
-
-
-def build_pcl_binner(lmax_pcl, lmin, nbins, lmax_user=None):
-    """Build the ell binning used for the pseudo-C_ell measurement.
-
-    Binning style is controlled by the global PCL_BINNING ('log' or 'linear').
-    """
-    lmin = max(2, int(lmin))
-    if nbins < 1:
-        raise ValueError("PCL_NBINS must be >= 1.")
-    if PCL_BINNING not in ("log", "linear"):
-        raise ValueError(f"PCL_BINNING must be 'log' or 'linear', got '{PCL_BINNING}'.")
-
-    lmax_cap = min(int(lmax_pcl), 3 * int(NSIDE) - 1)
-    if lmax_user is not None:
-        if int(lmax_user) < 2:
-            raise ValueError("PCL_LMAX must be >= 2 when provided.")
-        lmax_cap = min(lmax_cap, int(lmax_user))
-
-    ell_stop = lmax_cap + 1
-    if ell_stop <= lmin:
-        raise ValueError(
-            f"Pseudo-C_ell binning is invalid: lmin={lmin} but ell_stop={ell_stop}."
-        )
-
-    if PCL_BINNING == "log":
-        raw_edges = np.geomspace(lmin, ell_stop, nbins + 1)
-    else:
-        raw_edges = np.linspace(lmin, ell_stop, nbins + 1)
-    edges = np.rint(raw_edges).astype(int)
-    edges[0] = lmin
-    edges[-1] = ell_stop
-    edges = np.unique(edges)
-    if len(edges) < 2:
-        raise ValueError("Pseudo-C_ell binning collapsed to fewer than one bandpower.")
-
-    binner = nmt.NmtBin.from_edges(edges[:-1], edges[1:])
-    leff = np.asarray(binner.get_effective_ells(), dtype=float)
-    return binner, leff, edges
-
-
-def measure_pseudo_cl(ra, dec, data_columns, binner, workspace=None,
-                      return_coupled=False, lmax_syn=None):
-    """Measure pseudo-C_ell values from catalogue samples using NaMaster.
-
-    Pass a pre-built NmtWorkspace via *workspace* to skip recomputing the
-    coupling matrix (safe when positions/weights are fixed across realisations).
-    """
-    ra = np.asarray(ra, dtype=float)
-    dec = np.asarray(dec, dtype=float)
-    ra_wrapped = np.where(ra < 0.0, ra + 360.0, ra)
-
-    n_out = binner.lmax + 1 if return_coupled else len(binner.get_effective_ells())
-    pseudo_cls = {}
-    for name, values in data_columns.items():
-        values = np.asarray(values, dtype=float)
-        valid = np.isfinite(ra_wrapped) & np.isfinite(dec) & np.isfinite(values)
-        if not np.any(valid):
-            pseudo_cls[name] = np.full(n_out, np.nan, dtype=float)
-            continue
-        n_valid = int(valid.sum())
-        pos_data = np.vstack([ra_wrapped[valid], dec[valid]])
-        weights = np.ones(n_valid, dtype=float)
-        mean_sub = values[valid][np.newaxis, :] - np.mean(values[valid])
-        field = nmt.NmtFieldCatalog(pos_data, weights, mean_sub,
-                                    lmax=lmax_syn, lonlat=True)
-        ws = (workspace if workspace is not None
-              else nmt.NmtWorkspace.from_fields(field, field, binner))
-        coupled = nmt.compute_coupled_cell(field, field)
-        if return_coupled:
-            pseudo_cls[name] = np.asarray(coupled[0], dtype=float)
-        else:
-            pseudo_cls[name] = np.asarray(ws.decouple_cell(coupled)[0], dtype=float)
-
-    return pseudo_cls
-
-
-def generate_realisation(cl_full, lmax_syn, ra, dec, noise_mean, noise_var, seed):
-    """Draw a new alm realisation, evaluate at catalogue positions, and add noise.
-
-    Returns a dict with keys: DM, DM_gaussian, DM_lognormal.
-    """
-    rng = np.random.default_rng(seed)
-
-    ra_hp  = np.where(ra < 0, ra + 360.0, ra)
-    theta  = np.clip(np.radians(90.0 - dec), 1e-6, np.pi - 1e-6)
-    phi    = np.radians(ra_hp)
-    valid  = np.isfinite(theta) & np.isfinite(phi)
-    dm     = np.full(len(theta), np.nan)
-
-    np.random.seed(int(rng.integers(0, 2**31)))
-    alm = hp.synalm(cl_full, lmax=lmax_syn, new=True)
-    dm[valid] = evaluate_alm_at_positions(alm, lmax_syn, theta[valid], phi[valid])
-    noise_gauss = rng.normal(loc=noise_mean, scale=np.sqrt(noise_var), size=len(dm))
-
-    if noise_mean <= 0:
-        raise ValueError("NOISE_MEAN must be > 0 for the log-normal noise model.")
-    s_sq = np.log(1.0 + noise_var / noise_mean**2)
-    m    = np.log(noise_mean) - 0.5 * s_sq
-    noise_lognorm = rng.lognormal(mean=m, sigma=np.sqrt(s_sq), size=len(dm))
-
-    return {
-        "DM":           dm,
-        "DM_gaussian":  dm + noise_gauss,
-        "DM_lognormal": dm + noise_lognorm,
-    }
-
-
-def _load_npz_for_resume(npz_path):
-    data = np.load(npz_path, allow_pickle=False)
-    n_completed = int(data["n_completed"]) if "n_completed" in data else 0
-    return dict(data), n_completed
-
-
-def _save_npz(npz_path, **arrays):
-    os.makedirs(os.path.dirname(os.path.abspath(npz_path)), exist_ok=True)
-    stem = npz_path[:-4] if npz_path.endswith(".npz") else npz_path
-    tmp = stem + ".tmp.npz"
-    np.savez(tmp, **arrays)
-    os.replace(tmp, npz_path)
 
 
 def load_CHIME_catalog(lmax):
@@ -411,7 +187,7 @@ def load_CHIME_catalog(lmax):
     """
     from astropy.io import fits
     # NOTE: THIS PATH NEEDS TO BE MODIFIED
-    chime_fn = "/Users/robert/Downloads/chime_catalogue_nside4096_noise (2).fits"#"/global/homes/k/kwolz/CatalogCovariancesSandbox/data/chime_catalogue_nside4096_noise.fits"  # noqa: E501
+    chime_fn = "/Users/robert/Documents/Git/pseudo_catcell_covariance_benchmark/data/chimefrbcat2.fits"#"/global/homes/k/kwolz/CatalogCovariancesSandbox/data/chime_catalogue_nside4096_noise.fits"  # noqa: E501
     with fits.open(chime_fn) as hdul:
         print(hdul[1].columns.names)
         data = hdul[1].data
@@ -455,6 +231,195 @@ def load_positions_from_output(npz_path):
     return ra, dec
 
 
+def get_positions_for_realisation(idx, base_ra, base_dec, prob_mask, n_samples):
+    """Return the RA/Dec positions to use for a given realisation index."""
+    if POSITION_SOURCE != "mask" or POSITION_MASK_MODE == "fixed":
+        return base_ra, base_dec
+
+    rng_pos = np.random.default_rng(SEED_START + 1000000 + int(idx))
+    return sample_positions_from_probability_mask(prob_mask, n_samples=n_samples, rng=rng_pos)
+
+
+def build_cl_full(cl_path, nside, lmax_factor, ell_max_cap=None):
+    # NOTE: Here we simply read the per-multipole input data
+    cl_npz = np.load(cl_path)
+    if not {"ell", "cell"}.issubset(cl_npz.files):
+        raise ValueError(f"{cl_path} must contain 'ell' and 'cell' arrays")
+
+    ell   = np.asarray(cl_npz["ell"],  dtype=int)
+    cl_in = np.asarray(cl_npz["cell"], dtype=float)
+
+    return cl_in, ell[-1]
+
+    valid = np.isfinite(ell) & np.isfinite(cl_in) & (ell >= 2) & (cl_in > 0)
+    ell, cl_in = ell[valid], cl_in[valid]
+
+    sort_idx = np.argsort(ell)
+    unique_ell, unique_idx = np.unique(ell[sort_idx], return_index=True)
+    unique_cl = cl_in[sort_idx][unique_idx]
+
+    if len(unique_ell) < 4:
+        raise ValueError("Need at least 4 unique C_ell points for a cubic spline.")
+
+    cl_spline = InterpolatedUnivariateSpline(
+        np.log(unique_ell.astype(float)), np.log(unique_cl), k=3
+    )
+
+    lmax_syn = min(int(unique_ell.max()), lmax_factor * nside - 1)
+    if ell_max_cap is not None:
+        lmax_syn = min(lmax_syn, int(ell_max_cap))
+    ells_full = np.arange(lmax_syn + 1, dtype=float)
+    cl_full = np.zeros(lmax_syn + 1, dtype=float)
+
+    mask_eval = (ells_full >= max(2, unique_ell.min())) & (ells_full <= unique_ell.max())
+    cl_full[mask_eval] = np.exp(cl_spline(np.log(ells_full[mask_eval])))
+    cl_full[0] = 0.0
+    if lmax_syn >= 1:
+        cl_full[1] = 0.0
+    cl_full = np.maximum(cl_full, 0.0)
+
+    return cl_full, lmax_factor * nside - 1
+
+
+def evaluate_alm_at_positions(alm, lmax, theta, phi, epsilon=1e-7):
+    """Evaluate a scalar field from packed alm coefficients at arbitrary positions.
+
+    Uses ducc0.sht.synthesis_general for fast NUFFT-style evaluation
+    (healpy-packed alm, colatitude theta, longitude phi in radians).
+    """
+    import ducc0
+    theta = np.asarray(theta, dtype=float)
+    phi = np.asarray(phi, dtype=float)
+
+    if theta.shape != phi.shape:
+        raise ValueError("theta and phi must have the same shape")
+
+    if theta.size == 0:
+        return np.zeros(0, dtype=np.float64)
+
+    loc = np.stack([theta.ravel(), phi.ravel()], axis=1)
+    result = ducc0.sht.synthesis_general(
+        alm=np.asarray(alm, dtype=np.complex128)[np.newaxis],
+        spin=0, lmax=lmax, loc=loc, epsilon=epsilon,
+    )
+    return result[0].real.reshape(theta.shape)
+
+
+def build_pcl_binner(lmax_pcl, lmin, nbins, lmax_user=None):
+    """Build the geometric ell binning used for the pseudo-C_ell measurement."""
+    lmin = max(2, int(lmin))
+    if nbins < 1:
+        raise ValueError("PCL_NBINS must be >= 1.")
+
+    lmax_cap = min(int(lmax_pcl), 3 * int(NSIDE) - 1)
+    if lmax_user is not None:
+        if int(lmax_user) < 2:
+            raise ValueError("PCL_LMAX must be >= 2 when provided.")
+        lmax_cap = min(lmax_cap, int(lmax_user))
+
+    ell_stop = lmax_cap + 1
+    if ell_stop <= lmin:
+        raise ValueError(
+            f"Pseudo-C_ell binning is invalid: lmin={lmin} but ell_stop={ell_stop}."
+        )
+
+    raw_edges = np.geomspace(lmin, ell_stop, nbins + 1)
+    edges = np.rint(raw_edges).astype(int)
+    edges[0] = lmin
+    edges[-1] = ell_stop
+    edges = np.unique(edges)
+    if len(edges) < 2:
+        raise ValueError("Pseudo-C_ell binning collapsed to fewer than one bandpower.")
+
+    binner = nmt.NmtBin.from_edges(edges[:-1], edges[1:])
+    leff = np.asarray(binner.get_effective_ells(), dtype=float)
+    return binner, leff, edges
+
+
+def measure_pseudo_cl(ra, dec, data_columns, binner, workspace=None,
+                      return_coupled=False, lmax_syn=None):
+    """Measure pseudo-C_ell values from catalogue samples using NaMaster.
+
+    Pass a pre-built NmtWorkspace via *workspace* to skip recomputing the
+    coupling matrix (safe when positions/weights are fixed across realisations).
+    """
+    ra = np.asarray(ra, dtype=float)
+    dec = np.asarray(dec, dtype=float)
+    ra_wrapped = np.where(ra < 0.0, ra + 360.0, ra)
+
+    n_out = binner.lmax + 1 if return_coupled else len(binner.get_effective_ells())
+    pseudo_cls = {}
+    for name, values in data_columns.items():
+        values = np.asarray(values, dtype=float)
+        valid = np.isfinite(ra_wrapped) & np.isfinite(dec) & np.isfinite(values)
+        if not np.any(valid):
+            pseudo_cls[name] = np.full(n_out, np.nan, dtype=float)
+            continue
+        n_valid = int(valid.sum())
+        pos_data = np.vstack([ra_wrapped[valid], dec[valid]])
+        weights = np.ones(n_valid, dtype=float)
+        # NOTE: The catalog-based estimator is agnostic to white noise,
+        # so subtracting the mean shouldn't be necessary.
+        # mean_sub = values[valid][np.newaxis, :] - np.mean(values[valid])
+        field = nmt.NmtFieldCatalog(pos_data, weights, values[valid],
+                                    lmax=lmax_syn, lonlat=True)
+        ws = (workspace if workspace is not None
+              else nmt.NmtWorkspace.from_fields(field, field, binner))
+        coupled = nmt.compute_coupled_cell(field, field)
+        if return_coupled:
+            pseudo_cls[name] = np.asarray(coupled[0], dtype=float)
+        else:
+            pseudo_cls[name] = np.asarray(ws.decouple_cell(coupled)[0], dtype=float)
+
+    return pseudo_cls
+
+
+def generate_realisation(cl_full, lmax_syn, ra, dec, noise_mean, noise_var, seed):
+    """Draw a new alm realisation, evaluate at catalogue positions, and add noise.
+
+    Returns a dict with keys: DM, DM_gaussian, DM_lognormal.
+    """
+    rng = np.random.default_rng(seed)
+
+    ra_hp  = np.where(ra < 0, ra + 360.0, ra)
+    theta  = np.clip(np.radians(90.0 - dec), 1e-6, np.pi - 1e-6)
+    phi    = np.radians(ra_hp)
+    valid  = np.isfinite(theta) & np.isfinite(phi)
+    dm     = np.full(len(theta), np.nan)
+
+    np.random.seed(int(rng.integers(0, 2**31)))
+    alm = hp.synalm(cl_full, lmax=lmax_syn, new=True)
+    dm[valid] = evaluate_alm_at_positions(alm, lmax_syn, theta[valid], phi[valid])
+
+    noise_gauss = rng.normal(loc=noise_mean, scale=np.sqrt(noise_var), size=len(dm))
+
+    if noise_mean <= 0:
+        raise ValueError("NOISE_MEAN must be > 0 for the log-normal noise model.")
+    s_sq = np.log(1.0 + noise_var / noise_mean**2)
+    m    = np.log(noise_mean) - 0.5 * s_sq
+    noise_lognorm = rng.lognormal(mean=m, sigma=np.sqrt(s_sq), size=len(dm))
+
+    return {
+        "DM":           dm,
+        "DM_gaussian":  dm + noise_gauss,
+        "DM_lognormal": dm + noise_lognorm,
+    }
+
+
+def _load_npz_for_resume(npz_path):
+    data = np.load(npz_path, allow_pickle=False)
+    n_completed = int(data["n_completed"]) if "n_completed" in data else 0
+    return dict(data), n_completed
+
+
+def _save_npz(npz_path, **arrays):
+    os.makedirs(os.path.dirname(os.path.abspath(npz_path)), exist_ok=True)
+    stem = npz_path[:-4] if npz_path.endswith(".npz") else npz_path
+    tmp = stem + ".tmp.npz"
+    np.savez(tmp, **arrays)
+    os.replace(tmp, npz_path)
+
+
 def main():
     print(f"=== generate_mock_catalogues.py ===")
     print(f"  CL_PATH:         {CL_PATH}")
@@ -470,7 +435,6 @@ def main():
         print(f"  PCL_LMIN:        {PCL_LMIN}")
         print(f"  PCL_LMAX:        {PCL_LMAX if PCL_LMAX is not None else 'auto'}")
         print(f"  PCL_NBINS:       {PCL_NBINS}")
-        print(f"  PCL_BINNING:     {PCL_BINNING}")
         print(f"  PCL_COUPLED:     {PCL_COUPLED}")
     print(f"  RESUME:          {RESUME}")
     print(f"  WRITE_EVERY:     {WRITE_EVERY}")
@@ -485,73 +449,31 @@ def main():
     if POSITION_MASK_MODE not in {"fixed", "resample"}:
         raise ValueError("POSITION_MASK_MODE must be either 'fixed' or 'resample'")
 
-    # Build C_ell first so nside_cat is known before sampling mask positions.
-    print("\nBuilding interpolated C_ell...")
-    cl_full, lmax_syn, field_variance = build_cl_full(CL_PATH, NSIDE, LMAX_FACTOR, ell_max_cap=3 * NSIDE - 1)
-    print(f"  lmax_syn = {lmax_syn}")
-
-    # NSIDE used by NaMaster's NmtFieldCatalog for internal pixelisation.
-    nside_cat = int(2 ** np.ceil(np.log2(lmax_syn / 2.0)))
-    print(f"  nside_cat (NaMaster internal) = {nside_cat}")
-
     # Load positions
     print("Loading source positions...")
     prob_mask = None
     if POSITION_SOURCE == "catalog":
-        if True: #os.path.exists(OUTPUT_PATH) and RESUME:
-            ra, dec = load_positions_from_output(OUTPUT_PATH)
-            coords = np.stack([ra, dec], axis=1)
-            n_unique = len(np.unique(coords, axis=0))
-            if n_unique < len(ra):
-                print(f"  WARNING: {len(ra) - n_unique} duplicate (RA, Dec) pairs found.")
-        else:
-            ra, dec, DM = np.loadtxt(POSITIONS_PATH, usecols=(0, 1, 2), unpack=True)
-            coords = np.stack([ra, dec], axis=1)
-            n_unique = len(np.unique(coords, axis=0))
-            if n_unique < len(ra):
-                print(f"  WARNING: {len(ra) - n_unique} duplicate (RA, Dec) pairs found.")
-            ra_r, dec_r = np.radians(ra), np.radians(dec)
-            xyz = np.stack([np.cos(dec_r) * np.cos(ra_r),
-                            np.cos(dec_r) * np.sin(ra_r),
-                            np.sin(dec_r)], axis=1)
-            dot = xyz @ xyz.T
-            np.fill_diagonal(dot, -2.0)
-            i, j = np.unravel_index(dot.argmax(), dot.shape)
-            threshold = np.cos(np.radians(60.0 / 3600.0))
-            rows, cols = np.where(np.triu(dot > threshold, k=1))
-            if len(cols):
-                keep = np.ones(len(ra), dtype=bool)
-                keep[cols] = False
-                excluded_dm = DM[~keep]
-                ra, dec, DM = ra[keep], dec[keep], DM[keep]
-            _, dm_unique_idx = np.unique(DM, return_index=True)
-            dm_dup_mask = np.ones(len(DM), dtype=bool)
-            dm_dup_mask[dm_unique_idx] = False
-            if dm_dup_mask.any():
-                ra, dec, DM = ra[~dm_dup_mask], dec[~dm_dup_mask], DM[~dm_dup_mask]
-            pos = np.array([ra, dec])
-            pos, idx = np.unique(pos, axis=1, return_index=True)
-            ra, dec = pos[0], pos[1]
-        # Snap catalog positions to nside_cat pixel centres so evaluate_alm_at_positions
-        # and NaMaster's internal pixelisation are evaluated at exactly the same coordinates.
-        ra, dec = snap_positions_to_healpix(ra, dec, nside_cat)
+        #if os.path.exists(OUTPUT_PATH):  # and RESUME:
+        ra, dec = load_positions_from_output(OUTPUT_PATH)
+        # else:
+        #     ra, dec = np.loadtxt(POSITIONS_PATH, usecols=(0, 1), unpack=True)
         print(f"  {len(ra)} sources")
     else:
         prob_mask = load_probability_mask(POSITION_MASK_PATH)
         n_sources = N_SOURCES if N_SOURCES > 0 else len(np.loadtxt(POSITIONS_PATH, usecols=(0,)))
-        if n_sources < 1:
-            raise ValueError("Number of mask-sampled sources must be >= 1")
+        # if n_sources < 1:
+        #     raise ValueError("Number of mask-sampled sources must be >= 1")
 
-        if os.path.exists(OUTPUT_PATH) and RESUME and POSITION_MASK_MODE == "fixed":
+        if os.path.exists(OUTPUT_PATH) and POSITION_MASK_MODE == "fixed":  #and RESUME
             ra, dec = load_positions_from_output(OUTPUT_PATH)
         else:
             rng_initial = np.random.default_rng(SEED_START + 999999)
-            # Sample directly at nside_cat without replacement → no duplicates possible.
-            ra, dec = sample_positions_from_probability_mask(
-                prob_mask, n_sources, rng_initial, pixel_nside=nside_cat
-            )
+            ra, dec = sample_positions_from_probability_mask(prob_mask, n_sources, rng_initial)
         print(f"  {len(ra)} sources")
 
+    print("\nBuilding interpolated C_ell...")
+    cl_full, lmax_syn = build_cl_full(CL_PATH, NSIDE, LMAX_FACTOR, ell_max_cap=3 * NSIDE - 1)
+    print(f"  lmax_syn = {lmax_syn}", NSIDE)
 
     pcl_binner = None
     pcl_leff = None
@@ -567,27 +489,26 @@ def main():
             pcl_leff = np.arange(pcl_binner.lmax + 1, dtype=float)
         print(f"  {'multipoles' if PCL_COUPLED else 'bandpowers'}: {len(pcl_leff)}")
 
-        print("  Building NaMaster workspace from initial source positions...")
-        _pos_ws = np.vstack([np.where(ra < 0, ra + 360.0, ra).astype(float), dec.astype(float)])
-        _w_ws   = np.ones(len(ra), dtype=float)
-        _fv_ws  = np.ones((1, len(ra)), dtype=float)
-        _f_ws   = nmt.NmtFieldCatalog(_pos_ws, _w_ws, _fv_ws, lmax=pcl_binner.lmax, lonlat=True)
-        _ws_theory = nmt.NmtWorkspace.from_fields(_f_ws, _f_ws, pcl_binner)
-
-        _theory_cl = cl_full[:pcl_binner.lmax + 1]
-        if PCL_COUPLED:
-            pcl_theory_bandpowers = np.asarray(
-                _ws_theory.couple_cell([_theory_cl])[0], dtype=np.float64
-            )
-        else:
-            pcl_theory_bandpowers = np.asarray(
-                _ws_theory.decouple_cell(
-                    _ws_theory.couple_cell([_theory_cl])
-                )[0], dtype=np.float64
-            )
-
         if POSITION_SOURCE == "catalog" or POSITION_MASK_MODE == "fixed":
-            pcl_workspace = _ws_theory
+            print("  Building NaMaster workspace from fixed source positions...")
+            _pos_ws = np.vstack([np.where(ra < 0, ra + 360.0, ra).astype(float), dec.astype(float)])
+            _w_ws   = np.ones(len(ra), dtype=float)
+            _fv_ws  = np.ones(len(ra), dtype=float)
+            _f_ws   = nmt.NmtFieldCatalog(_pos_ws, _w_ws, _fv_ws, lmax=pcl_binner.lmax, lonlat=True)
+            pcl_workspace = nmt.NmtWorkspace.from_fields(_f_ws, _f_ws, pcl_binner)
+
+            _theory_cl = cl_full[:pcl_binner.lmax + 1]
+            if PCL_COUPLED:
+                pcl_theory_bandpowers = np.asarray(
+                    pcl_workspace.couple_cell([_theory_cl])[0], dtype=np.float64
+                )
+            else:
+                pcl_theory_bandpowers = np.asarray(
+                    pcl_workspace.decouple_cell(
+                        pcl_workspace.couple_cell([_theory_cl])
+                    )[0], dtype=np.float64
+                )
+            print(f"  theory: {np.array2string(pcl_theory_bandpowers, precision=3)}")
 
     n_src  = len(ra)
     n_bins = (pcl_binner.lmax + 1 if PCL_COUPLED else len(pcl_leff)) if MEASURE_PCL else 0
@@ -595,8 +516,6 @@ def main():
     dm_all         = np.full((N_REALISATIONS, n_src),   np.nan, dtype=np.float64)
     dm_gauss_all   = np.full((N_REALISATIONS, n_src),   np.nan, dtype=np.float64)
     dm_lognorm_all = np.full((N_REALISATIONS, n_src),   np.nan, dtype=np.float64)
-    seed_all         = np.full((N_REALISATIONS),   np.nan, dtype=np.int32)
-
     if MEASURE_PCL:
         pcl_dm_all       = np.full((N_REALISATIONS, n_bins), np.nan, dtype=np.float64)
         pcl_dm_gauss_all = np.full((N_REALISATIONS, n_bins), np.nan, dtype=np.float64)
@@ -637,9 +556,10 @@ def main():
             noise_var=np.float64(NOISE_VAR),
             position_source=np.bytes_(POSITION_SOURCE),
             position_mask_mode=np.bytes_(POSITION_MASK_MODE),
-            DM=dm_all[0],
+            DM=dm_all[:nc],
+            DM_gaussian=dm_gauss_all[:nc],
+            DM_lognormal=dm_lognorm_all[:nc],
             n_completed=np.int32(nc),
-            seeds = seed_all[:nc].astype(np.int32),
         )
         if MEASURE_PCL:
             d.update(
@@ -654,7 +574,7 @@ def main():
         return d
 
     for count, idx in enumerate(todo):
-        ra_i, dec_i = get_positions_for_realisation(idx, ra, dec, prob_mask, n_src, nside_cat=nside_cat)
+        ra_i, dec_i = get_positions_for_realisation(idx, ra, dec, prob_mask, n_src)
         data = generate_realisation(
             cl_full, lmax_syn, ra_i, dec_i,
             NOISE_MEAN, NOISE_VAR, seed=SEED_START + idx,
@@ -662,7 +582,6 @@ def main():
         dm_all[idx]         = data["DM"]
         dm_gauss_all[idx]   = data["DM_gaussian"]
         dm_lognorm_all[idx] = data["DM_lognormal"]
-        seed_all[idx]       = SEED_START + idx
 
         if MEASURE_PCL:
             pseudo_cls = measure_pseudo_cl(ra_i, dec_i, data, pcl_binner,
